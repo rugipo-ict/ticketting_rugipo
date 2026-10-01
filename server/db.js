@@ -137,6 +137,18 @@ async function runInTx(fn) {
   });
 }
 
+/**
+ * Run a function OUTSIDE any active transaction context. Background work
+ * (email delivery, sweeps) scheduled from inside a request transaction must
+ * never inherit that transaction's bound client — otherwise its queries join
+ * an uncommitted transaction (and stall other requests waiting on the same
+ * connection). AsyncLocalStorage propagates through timers/microtasks, so
+ * callers use this to cut the link deliberately.
+ */
+function runOutsideStore(fn) {
+  return als.exit(fn);
+}
+
 const db = {
   inTx() { return !!als.getStore(); },
 
@@ -508,4 +520,4 @@ async function seedIfEmpty() {
   await seedMasterData();
 }
 
-module.exports = { db, readyPromise, nextTicketNumber, LEVELS, MODES, LEVEL_VALUES, MODE_VALUES };
+module.exports = { db, readyPromise, nextTicketNumber, runOutsideStore, LEVELS, MODES, LEVEL_VALUES, MODE_VALUES };

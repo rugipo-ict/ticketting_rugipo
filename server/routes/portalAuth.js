@@ -14,6 +14,19 @@ const { cloudinaryUrl } = require('../uploads');
 const router = express.Router();
 
 const attempts = new Map(); // simple per-email lockout
+// Self-clean expired lockouts so a flood of junk emails cannot grow the Map.
+const attemptsSweeper = setInterval(() => {
+  const now = Date.now();
+  for (const [k, a] of attempts) if (a.lockedUntil !== 0 && a.lockedUntil <= now) attempts.delete(k);
+}, 5 * 60_000);
+if (attemptsSweeper.unref) attemptsSweeper.unref();
+
+/**
+ * Constant-time-ish rejection: comparing against a fixed dummy hash keeps the
+ * response time of "unknown email" the same as "wrong password", so attackers
+ * cannot probe which staff emails exist from timing alone.
+ */
+const DUMMY_HASH = '$2a$12$C6UzMDM.H6dfI/f/IKcEe.5uFfnMlwfVpOIhZCtFUAuUKFLfGcpKu';
 
 /** One canonical user shape everywhere (login, GET /me, POST /me). */
 function presentUser(u) {
@@ -41,7 +54,9 @@ router.post('/login', async (req, res) => {
   }
 
   const user = await db.get('SELECT * FROM users WHERE email = ? AND active = 1', email);
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+  const hash = user ? user.password_hash : DUMMY_HASH;
+  const passwordOk = bcrypt.compareSync(password, hash);
+  if (!user || !passwordOk) {
     const n = (a?.count || 0) + 1;
     attempts.set(email, { count: n, lockedUntil: n >= 5 ? Date.now() + 15 * 60_000 : 0 });
     return res.status(401).json({ error: 'Invalid email or password' });

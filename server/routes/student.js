@@ -21,6 +21,35 @@ const realtime = require('../realtime');
 
 const router = express.Router();
 
+/**
+ * Flood guard for public write endpoints (students never log in, so the IP is
+ * the only handle). Self-cleaning buckets: junk IPs cannot grow the Map
+ * without bound. Generous real-use ceilings — a student may correct a form
+ * several times — but a scripted flood of submissions (each one a DB write +
+ * a queued email) is cut off long before it can exhaust the free-tier
+ * database or the Brevo quota during a launch-day spike.
+ */
+const floodBuckets = new Map();
+function floodLimit(max, windowMs) {
+  const sweeper = setInterval(() => {
+    const now = Date.now();
+    for (const [k, e] of floodBuckets) if (e.resetAt <= now) floodBuckets.delete(k);
+  }, Math.min(windowMs, 60_000));
+  if (sweeper.unref) sweeper.unref();
+  return (req, res, next) => {
+    const key = `${req.ip}:${req.baseUrl}${req.path}`;
+    const now = Date.now();
+    let e = floodBuckets.get(key);
+    if (!e || e.resetAt <= now) { e = { count: 0, resetAt: now + windowMs }; floodBuckets.set(key, e); }
+    e.count += 1;
+    if (e.count > max) {
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil((e.resetAt - now) / 1000))));
+      return res.status(429).json({ error: 'Too many requests from this device. Please wait a few minutes and try again.' });
+    }
+    next();
+  };
+}
+
 // Live-chat push helpers from the websocket hub (set once the server mounts
 // this router — REST sends/closes fan out through these so both sides see
 // every message instantly, not just socket-originated ones).
@@ -60,7 +89,7 @@ function cleanText(value, maxLen = 500) {
  * exact email used before — neither is guessable to an outsider for a specific
  * student, and only name/department are returned (never phone).
  */
-router.post('/students/recognize', async (req, res) => {
+router.post('/students/recognize', floodLimit(20, 10 * 60_000), async (req, res) => {
   const matric = String(req.body?.matricNo || '').trim();
   const email = String(req.body?.email || '').trim().toLowerCase();
   if (!matric || !email) return res.status(400).json({ error: 'Enter your matric number and email first' });
@@ -142,7 +171,7 @@ async function recognizeStudent({ matricNo, regNo, studentName, email, phone, fa
 
 /* ------------------------------ create a ticket ---------------------------- */
 
-router.post('/tickets', upload.array('files', 5), async (req, res) => {
+router.post('/tickets', floodLimit(6, 10 * 60_000), upload.array('files', 5), async (req, res) => {
   const b = req.body || {};
   const fail = (msg, code = 400) => {
     (req.files || []).forEach((f) => fs.unlink(f.path, () => {}));
@@ -367,7 +396,7 @@ async function closeConversation(messageId) {
 }
 
 /** Public contact form — for questions that are not complaints. */
-router.post('/contact', async (req, res) => {
+router.post('/contact', floodLimit(5, 10 * 60_000), async (req, res) => {
   const b = req.body || {};
   const senderName = cleanText(b.name, 120);
   const email = String(b.email || '').trim().toLowerCase().slice(0, 160);
@@ -431,7 +460,7 @@ router.get('/chat/:token', async (req, res) => {
 });
 
 /** Student is typing — the ICT inbox shows "<Student> is typing…" live. */
-router.post('/chat/:token/typing', async (req, res) => {
+router.post('/chat/:token/typing', floodLimit(120, 5 * 60_000), async (req, res) => {
   const m = await db.get('SELECT id FROM contact_messages WHERE chat_token = ?', String(req.params.token));
   if (!m) return res.status(404).json({ error: 'This conversation link is not valid' });
   await db.run('UPDATE contact_messages SET student_typing_at = now() WHERE id = ?', m.id);
@@ -440,7 +469,7 @@ router.post('/chat/:token/typing', async (req, res) => {
 });
 
 /** Student sends a message into the conversation. */
-router.post('/chat/:token', async (req, res) => {
+router.post('/chat/:token', floodLimit(40, 5 * 60_000), async (req, res) => {
   const m = await db.get('SELECT * FROM contact_messages WHERE chat_token = ?', String(req.params.token));
   if (!m) return res.status(404).json({ error: 'This conversation link is not valid' });
   if (m.closed_at) return res.status(410).json({ error: 'This conversation is closed' });
@@ -457,7 +486,7 @@ router.post('/chat/:token', async (req, res) => {
 });
 
 /** Student closes the conversation — the whole history is deleted. */
-router.post('/chat/:token/close', async (req, res) => {
+router.post('/chat/:token/close', floodLimit(10, 5 * 60_000), async (req, res) => {
   const m = await db.get('SELECT id, chat_token FROM contact_messages WHERE chat_token = ?', String(req.params.token));
   if (!m) return res.status(404).json({ error: 'This conversation link is not valid' });
   await closeConversation(m.id);
@@ -470,7 +499,7 @@ router.post('/chat/:token/close', async (req, res) => {
 });
 
 /** Reply — the ticket's own email must be provided (ownership proof). */
-router.post('/tickets/:id/reply', async (req, res) => {
+router.post('/tickets/:id/reply', floodLimit(20, 10 * 60_000), async (req, res) => {
   const t = await db.get('SELECT * FROM tickets WHERE id = ? AND email = ?', req.params.id, String(req.body?.email || '').trim().toLowerCase());
   if (!t) return res.status(404).json({ error: 'Ticket not found. Check your tracking ID and email.' });
   if (['resolved', 'closed', 'rejected'].includes(t.status)) {
@@ -498,7 +527,7 @@ router.post('/tickets/:id/reply', async (req, res) => {
  * system line is written on the record. Also notifies the assigned staff by
  * email so it is not missed.
  */
-router.post('/tickets/:id/reopen', async (req, res) => {
+router.post('/tickets/:id/reopen', floodLimit(6, 10 * 60_000), async (req, res) => {
   const t = await db.get('SELECT * FROM tickets WHERE id = ? AND email = ?', req.params.id, String(req.body?.email || '').trim().toLowerCase());
   if (!t) return res.status(404).json({ error: 'Ticket not found. Check your tracking ID and email.' });
   if (!['resolved', 'closed'].includes(t.status)) {
@@ -526,7 +555,7 @@ router.post('/tickets/:id/reopen', async (req, res) => {
 /* -------------------------- attachments ------------------------------ */
 
 /** Add more files later — needs the ticket email as proof. */
-router.post('/tickets/:id/attachments', upload.array('files', 5), async (req, res) => {
+router.post('/tickets/:id/attachments', floodLimit(10, 10 * 60_000), upload.array('files', 5), async (req, res) => {
   const t = await db.get('SELECT * FROM tickets WHERE id = ? AND email = ?', req.params.id, String(req.body?.email || '').trim().toLowerCase());
   if (!t) {
     (req.files || []).forEach((f) => fs.unlink(f.path, () => {}));
@@ -615,7 +644,7 @@ router.get('/track/:number', async (req, res) => {
 
 /* ------------------------- newsletter (public) ------------------------ */
 
-router.post('/subscribe', async (req, res) => {
+router.post('/subscribe', floodLimit(5, 15 * 60_000), async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const name = req.body?.name ? String(req.body.name).slice(0, 120) : null;
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Enter a valid email address' });
@@ -648,7 +677,7 @@ router.post('/unsubscribe', async (req, res) => {
  * arrive by email and emails get deleted). This re-sends them to the email
  * on file — the email itself is the ownership proof, same as tracking.
  */
-router.post('/recover', async (req, res) => {
+router.post('/recover', floodLimit(4, 15 * 60_000), async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const kind = String(req.body?.kind || 'ids');
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Enter the email you used when logging the complaint' });

@@ -8,7 +8,7 @@
  * deliverPending() (any login, any new email trigger) retries it.
  */
 const nodemailer = require('nodemailer');
-const { db } = require('./db');
+const { db, runOutsideStore } = require('./db');
 const { wrapEmail, textToHtml } = require('./emailTemplate');
 
 const BREVO_URL = 'https://api.brevo.com/v3/smtp/email';
@@ -97,7 +97,19 @@ async function queueEmail({ ticketId = null, to, subject, body, kind = 'notifica
   await db.run(
     `INSERT INTO outbound_emails (ticket_id, to_email, subject, body, html, kind) VALUES (?, ?, ?, ?, ?, ?)`,
     ticketId, String(to).toLowerCase(), subject, body, html, kind);
-  deliverPending().catch((e) => console.error('[notify]', e.message));
+  scheduleDelivery();
+}
+
+/**
+ * Fire-and-forget delivery trigger. ALWAYS runs outside the caller's
+ * transaction context: queueEmail() is called inside DB transactions (ticket
+ * create, status changes), and a Brevo HTTP call that inherits the
+ * transaction's single DB connection would stall that transaction — and with
+ * a 2-connection pool, stall the whole API under load. Failure here is
+ * harmless: the row is already stored and every sweep retries it.
+ */
+function scheduleDelivery() {
+  runOutsideStore(() => deliverPending()).catch((e) => console.error('[notify]', e.message));
 }
 
 /**
@@ -116,6 +128,7 @@ async function deliverPending() {
   delivering = true;
   try {
     for (;;) {
+      // eslint-disable-next-line no-constant-condition
       // Reclaim stale "sending" rows (crashed mid-delivery) older than 5 min.
       await db.run(`UPDATE outbound_emails SET status='queued'
                     WHERE status='sending' AND created_at < now() - interval '5 minutes'`);
@@ -147,6 +160,20 @@ async function deliverPending() {
 async function retryFailed() {
   await db.run(`UPDATE outbound_emails SET status='queued' WHERE status='failed'`);
   return deliverPending();
+}
+
+/**
+ * Serverless safety net: a Vercel function freezes after responding, so a
+ * delivery scheduled mid-request may never finish there. Once the next
+ * request warms an instance up, this timer resumes whatever is still queued —
+ * the sweeper below (on node hosts) and this share the same guard, so they
+ * never run simultaneously on one instance.
+ */
+if (process.env.VERCEL && typeof setInterval === 'function') {
+  const sweeper = setInterval(() => {
+    scheduleDelivery();
+  }, 60 * 1000);
+  if (sweeper.unref) sweeper.unref();
 }
 
 /**

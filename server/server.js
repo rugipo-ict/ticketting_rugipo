@@ -4,7 +4,6 @@
  */
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
 const path = require('path');
 const { readyPromise } = require('./db');
 const studentRoutes = require('./routes/student');
@@ -17,27 +16,32 @@ const { startEmailSweeper } = require('./notify');
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS: same-origin is always allowed; dev server / other allowed origins come
-// from CLIENT_ORIGIN (comma-separated). Requests with no Origin header
-// (curl, mobile apps) are not CORS at all and pass through.
 const allowed = (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',').map(s => s.trim());
 const selfHost = process.env.SELF_HOST || `localhost:${process.env.PORT || 4010}`;
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    if (allowed.includes(origin)) return cb(null, true);
+// CORS: same-origin is always allowed (Origin host must match the request's
+// own Host — that is how the served frontend talks to the API on any domain);
+// dev server / other allowed origins come from CLIENT_ORIGIN (comma-separated).
+// Requests with no Origin header (curl, mobile apps) are not CORS at all and
+// pass through. FOREIGN origins are refused: a phishing site must never be
+// able to fire a signed-in officer's session from another domain.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin) return next();
+  let ok = allowed.includes(origin);
+  if (!ok) {
     try {
       const host = new URL(origin).host;
-      // The app serves its own frontend, so a request whose Origin matches the
-      // Host header (or the configured self host) IS our site — allow it. This
-      // makes any deployment domain (Railway, Render, a school domain) work
-      // without code changes; foreign sites stay blocked.
-      if (host === selfHost) return cb(null, true);
-      return cb(null, true); // same-origin requests carry our own host anyway
-    } catch { /* malformed origin header */ }
-    return cb(new Error('Not allowed by CORS'));
-  },
-}));
+      ok = host === selfHost || host === req.headers.host;
+    } catch { ok = false; }
+  }
+  if (!ok) return res.status(403).json({ error: 'Not allowed by CORS' });
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Sec-WebSocket-Protocol');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
 
 app.use(express.json({ limit: '64kb' }));
 
@@ -55,16 +59,26 @@ app.use((_req, res, next) => {
   next();
 });
 
-// Lightweight per-IP rate limit for auth-sensitive endpoints.
+// Lightweight per-IP rate limit for auth-sensitive endpoints. Buckets
+// self-clean on a timer so a flood of junk IPs (bot traffic, a port scan)
+// cannot grow the Map without bound and leak memory during a traffic spike.
 const hits = new Map();
 function rateLimit(max, windowMs) {
+  const hitsTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [k, e] of hits) if (e.resetAt <= now) hits.delete(k);
+  }, Math.min(windowMs, 60_000));
+  if (hitsTimer.unref) hitsTimer.unref(); // never keep the process alive for this
   return (req, res, next) => {
     const key = `${req.ip}:${req.path}`;
     const now = Date.now();
     let e = hits.get(key);
     if (!e || e.resetAt <= now) { e = { count: 0, resetAt: now + windowMs }; hits.set(key, e); }
     e.count += 1;
-    if (e.count > max) return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+    if (e.count > max) {
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil((e.resetAt - now) / 1000))));
+      return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+    }
     next();
   };
 }
